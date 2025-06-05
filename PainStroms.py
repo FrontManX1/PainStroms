@@ -1025,7 +1025,7 @@ async def real_time_status_tracker(threads, start_time, end_time):
             live.update(table)
             await asyncio.sleep(1)
 
-def main():
+async def main( ):
     global proxy_success, proxy_fail, total_requests, status_codes, average_rtt
 
     proxy_success = 0
@@ -1140,4 +1140,4 @@ def main():
     )
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
