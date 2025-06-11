@@ -1,0 +1,6 @@
+aiohttp
+httpx
+tls-client
+rich
+colorama
+aiohttp-socks
